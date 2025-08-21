@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>DSLR Live Preview</title>
+    <style>
+        body, html { margin:0; padding:0; height:100%; background:black; overflow:hidden; }
+        #preview { width:100%; height:100%; object-fit:contain; display:block; }
+        #overlay { position:absolute; top:20px; left:20px; color:lime; font-size:24px; font-family:monospace; }
+        #camera-select { position:absolute; top:20px; right:20px; z-index:10; }
+        #controls { position:absolute; bottom:20px; left:20px; z-index:10; }
+        button { padding:10px; margin-right:10px; font-size:16px; }
+    </style>
+</head>
+<body>
+    <img id="preview" src="/video">
+    <div id="overlay">Live Overlay</div>
+
+    <form id="camera-select">
+        <select name="camera_port" onchange="switchCamera(this.value)">
+            {% for port, model in cameras %}
+                <option value="{{ port }}">{{ model }} ({{ port }})</option>
+            {% endfor %}
+        </select>
+    </form>
+
+    <div id="controls">
+        <button onclick="captureImage()">Capture Image</button>
+        <button onclick="returnLive()">Return to Live</button>
+        <button onclick="downloadImage()">Download Image</button>
+    </div>
+
+    <script>
+        function switchCamera(port) {
+            fetch('/set_camera', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: 'camera_port=' + encodeURIComponent(port)
+            }).then(res => console.log('Switched camera'));
+        }
+
+        function captureImage() {
+            fetch('/capture', { method: 'POST' }).then(res => console.log('Capture triggered'));
+        }
+
+        function returnLive() {
+            fetch('/return_live', { method: 'POST' }).then(res => console.log('Returned to live'));
+        }
+
+        function downloadImage() {
+            window.location.href = '/download';
+        }
+    </script>
+</body>
+</html>
