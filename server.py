@@ -10,9 +10,8 @@ import sys
 from datetime import datetime
 from flask import Flask, Response, render_template, request, send_file
 
-app = Flask(__name__)
+app = Flask(__name__, static_folder="static", template_folder="templates")
 
-# Directory to save captured images
 SAVE_DIR = "captured_images"
 os.makedirs(SAVE_DIR, exist_ok=True)
 
@@ -27,19 +26,13 @@ mode = "live"  # "live", "capture", "captured"
 
 
 def list_cameras():
-    """Return a list of available cameras."""
-    cameras = gp.Camera.autodetect()
-    return cameras  # list of (port, model)
+    return gp.Camera.autodetect()
 
 
 def connect_camera(camera_port=None):
-    """Connect to a camera. If port is None, connect to first available camera."""
     cam = gp.Camera()
     try:
-        if camera_port:
-            cam.init(gp.Context())
-        else:
-            cam.init()
+        cam.init()
         summary = cam.get_summary()
         print(f"[INFO] Connected to camera:\n{str(summary)}")
     except gp.GPhoto2Error as e:
@@ -49,15 +42,13 @@ def connect_camera(camera_port=None):
 
 
 def capture_loop():
-    """Background thread to grab frames or full-resolution image."""
-    global latest_frame, captured_image, captured_filename, camera, running, mode
+    global latest_frame, captured_image, captured_filename, running, mode
 
     cam = connect_camera(camera_name)
 
     while running:
         try:
             if mode == "live" and cam:
-                # Low-res preview for streaming
                 camera_file = cam.capture_preview()
                 file_data = gp.check_result(gp.gp_file_get_data_and_size(camera_file))
                 data = memoryview(file_data).tobytes()
@@ -65,19 +56,17 @@ def capture_loop():
                 img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
                 if img is not None:
-                    img = cv2.flip(img, 1)  # mirror horizontally
+                    img = cv2.flip(img, 1)
                     ret, buffer = cv2.imencode('.jpg', img)
                     with lock:
                         latest_frame = buffer.tobytes()
 
             elif mode == "capture" and cam:
-                # Full-resolution capture
                 file_path = cam.capture(gp.GP_CAPTURE_IMAGE)
                 camera_file = cam.file_get(file_path.folder, file_path.name, gp.GP_FILE_TYPE_NORMAL)
                 data = gp.check_result(gp.gp_file_get_data_and_size(camera_file))
                 img_bytes = memoryview(data).tobytes()
 
-                # Save to server with timestamp
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 filename = f"capture_{timestamp}.jpg"
                 filepath = os.path.join(SAVE_DIR, filename)
@@ -87,10 +76,9 @@ def capture_loop():
                 with lock:
                     captured_image = img_bytes
                     captured_filename = filepath
-                    latest_frame = captured_image  # show captured image in feed
+                    latest_frame = captured_image
                     mode = "captured"
 
-                # Optionally delete from camera after capture
                 cam.file_delete(file_path.folder, file_path.name)
 
             else:
@@ -113,7 +101,6 @@ def capture_loop():
 
 
 def generate_frames():
-    """Stream frames to clients."""
     global latest_frame
     while True:
         with lock:
@@ -124,19 +111,18 @@ def generate_frames():
         else:
             time.sleep(0.1)
 
+
 def cleanup(sig, frame):
-    """Graceful shutdown on CTRL+C."""
     global running, camera
     print("\n[INFO] Shutting down server...")
     running = False
-    # Exit camera safely
     try:
         if camera:
-            print("nooooo")
             camera.exit()
     except:
         pass
     sys.exit(0)
+
 
 @app.route('/')
 def index():
@@ -146,7 +132,6 @@ def index():
 
 @app.route('/set_camera', methods=['POST'])
 def set_camera():
-    """Switch camera."""
     global camera_name
     selected_port = request.form.get('camera_port')
     print(f"[INFO] Switching camera to {selected_port}")
@@ -157,7 +142,6 @@ def set_camera():
 
 @app.route('/capture', methods=['POST'])
 def capture():
-    """Trigger full-resolution capture."""
     global mode
     mode = "capture"
     return "Capturing", 200
@@ -165,7 +149,6 @@ def capture():
 
 @app.route('/return_live', methods=['POST'])
 def return_live():
-    """Return to live preview."""
     global mode
     mode = "live"
     return "Live", 200
@@ -173,7 +156,6 @@ def return_live():
 
 @app.route('/download')
 def download_image():
-    """Download the last captured image."""
     global captured_image, captured_filename
     if captured_image and captured_filename:
         return send_file(captured_filename,
