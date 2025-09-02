@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 # server.py — DSLR control on Raspberry Pi (Flask + gphoto2 + OpenCV)
 # Features:
-# - Live preview via /video_feed (MJPEG)
+# - Live preview via /video_feed (MJPEG, no-cache)
 # - Select camera port via /set_camera
-# - Robust capture via /capture (handles JPEG/RAW correctly)
-# - Latest file download via /download
+# - Robust capture via /capture (correct MIME/extension; JPEG/RAW safe)
+# - Confirm via /confirm to clear captured state and return to live
+# - Serve last file via /captured_images/<name> or /download
 # Notes:
-# - Requires: pip install flask flask-cors opencv-python numpy pillow imageio
-# - Enable camera live view on the DSLR if needed.
+#   pip install flask flask-cors opencv-python numpy pillow imageio
+#   Enable camera live view on the DSLR if needed.
 
 import os
-import io
 import sys
 import time
 import signal
@@ -21,14 +21,16 @@ from datetime import datetime
 import cv2
 import numpy as np
 import gphoto2 as gp
-from flask import Flask, Response, request, send_file
+from flask import Flask, Response, request, send_file, send_from_directory, jsonify
 from flask_cors import CORS
 
 # ------------------------------------------------------------
-# Flask app & setup
+# Flask app & CORS
 # ------------------------------------------------------------
+FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:3000")
+
 app = Flask(__name__)
-CORS(app)
+CORS(app, resources={r"/*": {"origins": FRONTEND_ORIGIN}})
 
 SAVE_DIR = "captured_images"
 os.makedirs(SAVE_DIR, exist_ok=True)
@@ -37,8 +39,8 @@ os.makedirs(SAVE_DIR, exist_ok=True)
 # Global state
 # ------------------------------------------------------------
 selected_port = None          # e.g. "usb:001,010"
-latest_frame = None           # bytes (JPEG)
-captured_image = None         # bytes (for download)
+latest_frame = None           # bytes (JPEG; for MJPEG stream)
+captured_image = None         # bytes (for /download)
 captured_filename = None      # str (path on disk)
 mode = "live"                 # "live" or "captured" (informational)
 running = False               # capture thread control
@@ -55,6 +57,12 @@ EXT_MAP = {
     'image/x-nikon-nef': '.nef',
     'image/tiff': '.tif',
 }
+
+def _nocache_headers(resp):
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+    return resp
 
 def _choose_ext(mime: str, fallback_name: str) -> str:
     ext = EXT_MAP.get(mime)
@@ -78,12 +86,12 @@ def connect_camera(camera_port=None):
             if idx < 0:
                 raise gp.GPhoto2Error(gp.GP_ERROR_BAD_PARAMETERS)
             cam.set_port_info(pil[idx])
+
         cam.init()
 
-        # Try to nudge format to JPEG if supported (optional)
+        # Best-effort set to JPEG if supported (camera may ignore)
         try_set_image_jpeg(cam)
 
-        # Log basic info
         try:
             summary = cam.get_summary()
             print(f"[INFO] Connected at {camera_port or '(auto)'}:\n{str(summary)}")
@@ -108,7 +116,7 @@ def _check_preview_support(cam):
         return False
 
 def try_set_image_jpeg(cam):
-    """Best-effort set image format to a JPEG mode (may be ignored by some bodies)."""
+    """Best-effort set image format to a JPEG mode (may be ignored)."""
     try:
         cfg = cam.get_config()
         for key in ('imageformat', 'imagequality'):
@@ -172,7 +180,6 @@ def safe_capture_one(cam):
     host_filename = f"capture_{ts}{ext}"
     host_filepath = os.path.join(SAVE_DIR, host_filename)
 
-    # Reliable save
     _safe_save_camera_file(camera_file, host_filepath)
 
     # Optionally delete from camera (keeps SD card tidy)
@@ -288,8 +295,9 @@ def capture():
     """
     Shoots one frame, saves with the correct extension, and updates the MJPEG stream
     ONLY with real JPEG bytes. If the capture is RAW, it tries the embedded preview.
+    Returns JSON: {"url": "/captured_images/<filename>"}
     """
-    global mode, captured_image, captured_filename, selected_port
+    global mode, captured_image, captured_filename, selected_port, latest_frame
 
     # Pause preview so we don't fight for camera
     stop_capture_thread()
@@ -319,7 +327,8 @@ def capture():
             _update_latest_with_camera_preview(cam, cam_folder, cam_name)
 
         mode = "captured"
-        return "Captured", 200
+        rel_url = f"/{os.path.join(SAVE_DIR, os.path.basename(host_filepath))}"
+        return jsonify({"url": rel_url}), 200
 
     except Exception as e:
         print(f"[ERROR] capture failed: {e}")
@@ -329,30 +338,73 @@ def capture():
             cam.exit()
         except Exception:
             pass
-        # Resume live view
+        # Clear the last still so the next /video_feed frame is fresh
+        with lock:
+            if mode == "live":
+                latest_frame = None
+        # Resume live view thread (it will repopulate latest_frame)
         start_capture_thread()
+
+@app.route('/confirm', methods=['POST'])
+def confirm():
+    """
+    Called after the user confirms the captured photo on the frontend.
+    Clears captured state, ensures we are back in live mode, restarts preview.
+    Returns the live stream URL with a cache-buster.
+    """
+    global mode, captured_image, captured_filename, latest_frame
+    captured_image = None
+    captured_filename = None
+    mode = "live"
+
+    # Restart preview thread and clear frame so we get fresh MJPEG bytes
+    stop_capture_thread()
+    with lock:
+        latest_frame = None
+    start_capture_thread()
+
+    ts = int(time.time() * 1000)
+    return jsonify({"video": f"/video_feed?ts={ts}"}), 200
 
 @app.route('/return_live', methods=['POST'])
 def return_live():
-    global mode
+    """
+    Legacy route: same idea as /confirm but without returning a URL.
+    """
+    global mode, captured_image, captured_filename, latest_frame
+    captured_image = None
+    captured_filename = None
     mode = "live"
+    stop_capture_thread()
+    with lock:
+        latest_frame = None
+    start_capture_thread()
     return "Live", 200
 
 @app.route('/video_feed')
 def video_feed():
-    """Stream the live preview frames."""
-    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+    """Stream the live preview frames with no-cache headers."""
+    resp = Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+    # Some proxies buffer MJPEG; this header hints not to.
+    resp.headers["X-Accel-Buffering"] = "no"
+    return _nocache_headers(resp)
+
+@app.route('/captured_images/<path:filename>')
+def serve_captured_image(filename):
+    resp = send_from_directory(SAVE_DIR, filename)
+    return _nocache_headers(resp)
 
 @app.route('/download')
 def download_image():
     global captured_image, captured_filename
     if captured_image and captured_filename:
-        return send_file(
+        resp = send_file(
             captured_filename,
             mimetype='image/jpeg' if captured_filename.lower().endswith('.jpg') else None,
-            as_attachment=True,
+            as_attachment=False,  # inline; change to True if you want download
             download_name=os.path.basename(captured_filename)
         )
+        return _nocache_headers(resp)
     else:
         return "No image captured", 404
 
