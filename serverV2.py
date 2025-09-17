@@ -328,7 +328,7 @@ def capture():
 
         mode = "captured"
         rel_url = f"/{os.path.join(SAVE_DIR, os.path.basename(host_filepath))}"
-        return jsonify({"url": rel_url}), 200
+        return jsonify({"url": rel_url,"serverPath": host_filepath}), 200
 
     except Exception as e:
         print(f"[ERROR] capture failed: {e}")
